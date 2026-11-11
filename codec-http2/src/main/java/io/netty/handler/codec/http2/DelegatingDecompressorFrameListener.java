@@ -16,10 +16,12 @@ package io.netty.handler.codec.http2;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.handler.codec.compression.DecompressionException;
 import io.netty.handler.codec.compression.Brotli;
 import io.netty.handler.codec.compression.BrotliDecoder;
 import io.netty.handler.codec.compression.ZlibCodecFactory;
@@ -50,18 +52,44 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     private final Http2Connection connection;
     private final boolean strict;
+    private final int maxAllocation;
     private boolean flowControllerInitialized;
     private final Http2Connection.PropertyKey propertyKey;
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener) {
-        this(connection, listener, true);
+        this(connection, listener, true, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream before the stream is
+     *                      failed. {@code 0} means no limit. Bounding the decompressed output guards against
+     *                      decompression-bomb attacks (CVE-2026-42587).
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    int maxAllocation) {
+        this(connection, listener, true, maxAllocation);
     }
 
     public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
                     boolean strict) {
+        this(connection, listener, strict, 0);
+    }
+
+    /**
+     * Create a new instance.
+     *
+     * @param maxAllocation maximum number of decompressed bytes allowed for a single stream before the stream is
+     *                      failed. {@code 0} means no limit. Bounding the decompressed output guards against
+     *                      decompression-bomb attacks (CVE-2026-42587).
+     */
+    public DelegatingDecompressorFrameListener(Http2Connection connection, Http2FrameListener listener,
+                    boolean strict, int maxAllocation) {
         super(listener);
         this.connection = connection;
         this.strict = strict;
+        this.maxAllocation = checkPositiveOrZero(maxAllocation, "maxAllocation");
 
         propertyKey = connection.newKey();
         connection.addListener(new Http2ConnectionAdapter() {
@@ -113,25 +141,36 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
     protected EmbeddedChannel newContentDecompressor(final ChannelHandlerContext ctx, CharSequence contentEncoding)
             throws Http2Exception {
         if (GZIP.contentEqualsIgnoreCase(contentEncoding) || X_GZIP.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
         }
         if (DEFLATE.contentEqualsIgnoreCase(contentEncoding) || X_DEFLATE.contentEqualsIgnoreCase(contentEncoding)) {
             final ZlibWrapper wrapper = strict ? ZlibWrapper.ZLIB : ZlibWrapper.ZLIB_OR_NONE;
             // To be strict, 'deflate' means ZLIB, but some servers were not implemented correctly.
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), ZlibCodecFactory.newZlibDecoder(wrapper));
+            return newDecompressorChannel(ctx, ZlibCodecFactory.newZlibDecoder(wrapper));
         }
         if (Brotli.isAvailable() && BR.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-              ctx.channel().config(), new BrotliDecoder());
+            return newDecompressorChannel(ctx, new BrotliDecoder());
         }
         if (SNAPPY.contentEqualsIgnoreCase(contentEncoding)) {
-            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
-                    ctx.channel().config(), new SnappyFrameDecoder());
+            return newDecompressorChannel(ctx, new SnappyFrameDecoder());
         }
         // 'identity' or unsupported
         return null;
+    }
+
+    /**
+     * Build the per-stream {@link EmbeddedChannel} that performs decompression. When {@code maxAllocation > 0} a
+     * {@link DecompressionLimiter} is appended after the decoder so the total decompressed output is bounded,
+     * mirroring the {@code maxAllocation} enforcement performed by the standalone compression decoders but kept
+     * self-contained within this module (so it does not depend on a patched {@code netty-codec}).
+     */
+    private EmbeddedChannel newDecompressorChannel(final ChannelHandlerContext ctx, ChannelHandler decoder) {
+        if (maxAllocation > 0) {
+            return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                    ctx.channel().config(), decoder, new DecompressionLimiter(maxAllocation));
+        }
+        return new EmbeddedChannel(ctx.channel().id(), ctx.channel().metadata().hasDisconnect(),
+                ctx.channel().config(), decoder);
     }
 
     /**
@@ -203,6 +242,35 @@ public class DelegatingDecompressorFrameListener extends Http2FrameListenerDecor
 
     Http2Decompressor decompressor(Http2Stream stream) {
         return stream == null ? null : (Http2Decompressor) stream.getProperty(propertyKey);
+    }
+
+    /**
+     * Inbound handler appended after the decoder inside the per-stream decompression {@link EmbeddedChannel}.
+     * It tracks the cumulative number of decompressed bytes and fails the stream once {@code maxAllocation} is
+     * exceeded. Because the decoders forward their output synchronously through the pipeline, throwing here aborts
+     * the in-progress decompression after at most one extra output chunk, so the bound is enforced without modifying
+     * (or depending on a patched) {@code netty-codec}.
+     */
+    private static final class DecompressionLimiter extends ChannelInboundHandlerAdapter {
+        private final int maxAllocation;
+        private long totalOutputBytes;
+
+        DecompressionLimiter(int maxAllocation) {
+            this.maxAllocation = maxAllocation;
+        }
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof ByteBuf) {
+                totalOutputBytes += ((ByteBuf) msg).readableBytes();
+                if (totalOutputBytes > maxAllocation) {
+                    ((ByteBuf) msg).release();
+                    throw new DecompressionException(
+                            "Decompression buffer has reached maximum size: " + maxAllocation);
+                }
+            }
+            ctx.fireChannelRead(msg);
+        }
     }
 
     /**
