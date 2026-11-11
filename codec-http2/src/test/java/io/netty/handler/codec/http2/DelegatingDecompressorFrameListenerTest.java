@@ -24,6 +24,8 @@ import io.netty.handler.codec.compression.SnappyFrameEncoder;
 import io.netty.util.CharsetUtil;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -35,7 +37,12 @@ import java.util.List;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
 import static io.netty.handler.codec.http.HttpHeaderValues.SNAPPY;
+import static io.netty.handler.codec.http2.Http2Error.FLOW_CONTROL_ERROR;
+import static io.netty.handler.codec.http2.Http2Exception.streamError;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyBoolean;
@@ -43,6 +50,7 @@ import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -88,6 +96,53 @@ public class DelegatingDecompressorFrameListenerTest {
             stream.close();
         }
         channel.finishAndReleaseAll();
+    }
+
+    @Test
+    public void testDecompressedBuffersReleasedOnSuccess() throws Exception {
+        ByteBuf data = snappyFramed("abc", "def");
+        try {
+            assertEquals(0, decompressorListener.onDataRead(ctx, STREAM_ID, data, 0, true));
+            // Every decompressed chunk is delivered on its own, the end of the stream is signalled afterwards.
+            verify(listener, times(2)).onDataRead(eq(ctx), eq(STREAM_ID), any(ByteBuf.class), eq(0), eq(false));
+            verify(listener).onDataRead(eq(ctx), eq(STREAM_ID), any(ByteBuf.class), eq(0), eq(true));
+            assertEquals(1, data.refCnt());
+        } finally {
+            data.release();
+        }
+    }
+
+    @Test
+    public void testDecompressedBuffersReleasedWhenListenerThrows() throws Exception {
+        when(listener.onDataRead(any(ChannelHandlerContext.class), anyInt(), any(ByteBuf.class), anyInt(),
+                anyBoolean())).thenThrow(new IllegalStateException("listener failure"));
+        assertDecompressedBuffersReleasedOnFailure();
+    }
+
+    @Test
+    public void testDecompressedBuffersReleasedWhenFlowControllerThrows() throws Exception {
+        when(flowController.consumeBytes(any(Http2Stream.class), anyInt()))
+                .thenThrow(streamError(STREAM_ID, FLOW_CONTROL_ERROR, "flow control failure"));
+        assertDecompressedBuffersReleasedOnFailure();
+    }
+
+    private void assertDecompressedBuffersReleasedOnFailure() {
+        // A single DATA frame carrying two snappy chunks is decompressed into two buffers, so the second
+        // (look-ahead) buffer is already held when the first one is passed to the listener.
+        final ByteBuf data = snappyFramed("abc", "def");
+        try {
+            assertThrows(Http2Exception.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    decompressorListener.onDataRead(ctx, STREAM_ID, data, 0, false);
+                }
+            });
+            // Uncompressed snappy chunks are retained slices of the input, so every decompressed buffer that was
+            // not released keeps an extra reference on it.
+            assertEquals(1, data.refCnt());
+        } finally {
+            data.release();
+        }
     }
 
     /**
@@ -159,6 +214,38 @@ public class DelegatingDecompressorFrameListenerTest {
         } finally {
             received.release();
         }
+    }
+
+    @Test
+    public void decompressedBufferIsReleasedWhenListenerThrows() throws Exception {
+        final Http2Exception failure = streamError(STREAM_ID, Http2Error.INTERNAL_ERROR, "boom");
+        when(listener.onDataRead(any(ChannelHandlerContext.class), anyInt(), any(ByteBuf.class), anyInt(),
+                anyBoolean())).thenAnswer(new Answer<Integer>() {
+            @Override
+            public Integer answer(InvocationOnMock invocation) throws Throwable {
+                ByteBuf data = (ByteBuf) invocation.getArguments()[2];
+                if (data.isReadable()) {
+                    throw failure;
+                }
+                return (Integer) invocation.getArguments()[3];
+            }
+        });
+
+        final ByteBuf compressed = snappyCompress(new byte[CHUNKS * CHUNK_SIZE]);
+        try {
+            Http2Exception thrown = assertThrows(Http2Exception.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    decompressorListener.onDataRead(ctx, STREAM_ID, compressed, 0, false);
+                }
+            });
+            assertSame(failure, thrown);
+        } finally {
+            compressed.release();
+        }
+        assertFalse(allocator.allocated.isEmpty());
+        // Neither the chunk handed to the failing listener nor any chunk decompressed afterwards may be retained.
+        assertEquals(0, allocator.liveBuffers());
     }
 
     private static ByteBuf snappyCompress(byte[] data) {
