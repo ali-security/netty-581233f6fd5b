@@ -299,6 +299,35 @@ public class HttpConversionUtilTest {
     }
 
     @Test
+    public void toHttp2HeadersRejectsIllegalHeaderValuesByDefault() {
+        final HttpRequest msg = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/", false);
+        msg.headers().add(HOST, "example.org");
+        msg.headers().add(HttpConversionUtil.ExtensionHeaderNames.SCHEME.text(), "https");
+        msg.headers().add("x-foo", "bar\r\nx-injected: 1");
+        IllegalArgumentException e = assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                HttpConversionUtil.toHttp2Headers(msg, true);
+            }
+        });
+        assertTrue(e.getMessage().contains("x-foo"), e.getMessage());
+    }
+
+    @Test
+    public void toHttp2HeadersRejectsIllegalCookieCrumbValues() {
+        final HttpHeaders inHeaders = new DefaultHttpHeaders(false);
+        // The second crumb is a slice that starts well into the cookie value's backing array.
+        inHeaders.add(COOKIE, "first-cookie-with-a-long-value=1; c=d\r\nx-injected: 1");
+        IllegalStateException e = assertThrows(IllegalStateException.class, new Executable() {
+            @Override
+            public void execute() {
+                HttpConversionUtil.toHttp2Headers(inHeaders, new DefaultHttp2Headers());
+            }
+        });
+        assertTrue(e.getCause() instanceof IllegalArgumentException);
+    }
+
+    @Test
     public void connectionSpecificHeadersShouldBeRemoved() {
         HttpHeaders inHeaders = new DefaultHttpHeaders();
         inHeaders.add(CONNECTION, "keep-alive");

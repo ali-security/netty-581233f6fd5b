@@ -18,11 +18,13 @@ package io.netty.handler.codec.http2;
 
 import io.netty.handler.codec.http2.Http2Headers.PseudoHeaderName;
 import io.netty.util.AsciiString;
+import io.netty.util.CharsetUtil;
 import io.netty.util.internal.StringUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Map.Entry;
 
@@ -55,6 +57,108 @@ public class DefaultHttp2HeadersTest {
                 new DefaultHttp2Headers().add(StringUtil.EMPTY_STRING, "foo");
             }
         });
+    }
+
+    @ParameterizedTest
+    @ValueSource(chars = {'\0', '\n', '\r'})
+    public void headerValueValidationIsEnabledByDefault(final char illegalChar) {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers().add("headername", "fo" + illegalChar + "o");
+            }
+        });
+    }
+
+    @Test
+    public void headerValueValidationAppliesToAllMutatorsByDefault() {
+        final String injected = "foo\r\nx-injected: 1";
+        final Http2Headers headers = new DefaultHttp2Headers();
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.set("headername", injected);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.add("headername", "ok", injected);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.addObject("headername", injected);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.setObject("headername", "ok", injected);
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.path("/foo\r\nx-injected: 1");
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.status("200\nx-injected: 1");
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                headers.add(new DefaultHttp2Headers(false).add("headername", injected));
+            }
+        });
+        for (Entry<CharSequence, CharSequence> header : headers) {
+            assertEquals(-1, header.getValue().toString().indexOf('\n'), "stored an invalid value: " + header);
+        }
+    }
+
+    @Test
+    public void headerValueValidationChecksWholeAsciiStringSlice() {
+        // The value is a slice that does not start at the beginning of its backing array.
+        byte[] bytes = "ignored-prefix:fo\r\nx-injected: 1".getBytes(CharsetUtil.US_ASCII);
+        int offset = "ignored-prefix:".length();
+        final AsciiString value = new AsciiString(bytes, offset, bytes.length - offset, false);
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                new DefaultHttp2Headers().add("headername", value);
+            }
+        });
+    }
+
+    @Test
+    public void headerValueValidationAllowsLegalValues() {
+        Http2Headers headers = new DefaultHttp2Headers();
+        headers.add("empty", "");
+        headers.add("ows", "a \tb");
+        headers.add("obs-text", "" + (char) 0xE9 + 'a' + (char) 0xFF);
+        // Characters above 0xFF are sanitized to '?' by the HPACK encoder.
+        headers.add("non-latin1", "a" + (char) 0x100 + (char) 0xFFFF);
+        assertEquals(4, headers.size());
+    }
+
+    @Test
+    public void headerValueValidationCanBeDisabled() {
+        Http2Headers headers = new DefaultHttp2Headers(false);
+        headers.add("headername", "fo\r\n\0o");
+        assertEquals("fo\r\n\0o", headers.get("headername").toString());
+
+        headers = new DefaultHttp2Headers(false, 16);
+        headers.add("headername", " fo\no");
+        assertEquals(" fo\no", headers.get("headername").toString());
+
+        headers = new DefaultHttp2Headers(true, false, 16);
+        headers.add("headername", "fo\no");
+        assertEquals("fo\no", headers.get("headername").toString());
     }
 
     @Test

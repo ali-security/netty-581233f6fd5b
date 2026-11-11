@@ -142,6 +142,36 @@ public class DefaultHttp2HeadersDecoderTest {
     }
 
     @Test
+    public void illegalHeaderValuesMustFailValidation() throws Exception {
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(), encode(b("headername"), b("fo\no")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true), encode(b("headername"), b("fo\no")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true, MAX_HEADER_LIST_SIZE),
+            encode(b("headername"), b("fo\no")));
+    }
+
+    @Test
+    public void illegalHeaderValuesMustFailValidationForAllDefaultDecoders() throws Exception {
+        // This is the decoder Http2ConnectionHandlerBuilder (and the other builders) create by default.
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(true, MAX_HEADER_LIST_SIZE, -1),
+                encode(b("headername"), b("fo\r\nx-injected: 1")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(),
+                encode(b(":method"), b("GET"), b(":path"), b("/foo\r\nx-injected: 1")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(), encode(b("headername"), b("fo\0o")));
+        verifyValidationFails(new DefaultHttp2HeadersDecoder(), encode(b("headername"), b("fo\ro")));
+    }
+
+    @Test
+    public void illegalHeaderValuesAreAllowedWhenValueValidationIsDisabled() throws Exception {
+        ByteBuf buf = encode(b("headername"), b("fo\no"));
+        try {
+            Http2Headers headers = new DefaultHttp2HeadersDecoder(true, false).decodeHeaders(1, buf);
+            assertEquals("fo\no", headers.get("headername").toString());
+        } finally {
+            buf.release();
+        }
+    }
+
+    @Test
     public void decodingTrailersTeHeaderMustNotFailValidation() throws Exception {
         // The TE header is expressly allowed to have the value "trailers".
         ByteBuf buf = null;

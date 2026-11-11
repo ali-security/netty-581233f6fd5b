@@ -16,7 +16,6 @@ package io.netty.handler.codec.http2;
 
 import io.netty.handler.codec.CharSequenceValueConverter;
 import io.netty.handler.codec.DefaultHeaders;
-import io.netty.handler.codec.http.HttpHeaderValidationUtil;
 import io.netty.util.AsciiString;
 import io.netty.util.ByteProcessor;
 import io.netty.util.internal.PlatformDependent;
@@ -83,10 +82,10 @@ public class DefaultHttp2Headers
         }
     };
 
-    private static final ValueValidator<CharSequence> VALUE_VALIDATOR = new ValueValidator<CharSequence>() {
+    static final ValueValidator<CharSequence> HTTP2_VALUE_VALIDATOR = new ValueValidator<CharSequence>() {
         @Override
         public void validate(CharSequence value) {
-            int index = HttpHeaderValidationUtil.validateValidHeaderValue(value);
+            int index = validateValidHeaderValue(value);
             if (index != -1) {
                 throw new IllegalArgumentException("a header value contains prohibited character 0x" +
                         Integer.toHexString(value.charAt(index)) + " at index " + index + '.');
@@ -99,65 +98,56 @@ public class DefaultHttp2Headers
     /**
      * Create a new instance.
      * <p>
-     * Header names will be validated according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>.
+     * Header names and values will be validated according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
      */
     public DefaultHttp2Headers() {
-        this(true);
+        this(true, true, 16);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validate {@code true} to validate header names and values according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
+     * {@code false} to not validate header names or values.
      */
-    @SuppressWarnings("unchecked")
     public DefaultHttp2Headers(boolean validate) {
-        // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
-        // headers.
-        super(CASE_SENSITIVE_HASHER,
-              CharSequenceValueConverter.INSTANCE,
-              validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL);
+        this(validate, validate, 16);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validate {@code true} to validate header names and values according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>.
+     * {@code false} to not validate header names or values.
      * @param arraySizeHint A hint as to how large the hash data structure should be.
      * The next positive power of two will be used. An upper bound may be enforced.
      * @see DefaultHttp2Headers#DefaultHttp2Headers(boolean, boolean, int)
      */
     @SuppressWarnings("unchecked")
     public DefaultHttp2Headers(boolean validate, int arraySizeHint) {
-        // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
-        // headers.
-        super(CASE_SENSITIVE_HASHER,
-              CharSequenceValueConverter.INSTANCE,
-              validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
-              arraySizeHint);
+        this(validate, validate, arraySizeHint);
     }
 
     /**
      * Create a new instance.
-     * @param validate {@code true} to validate header names according to
-     * <a href="https://tools.ietf.org/html/rfc7540">rfc7540</a>. {@code false} to not validate header names.
+     * @param validateNames {@code true} to validate header names according to
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html">RFC 9113</a>. {@code false} to not validate header names.
      * @param validateValues {@code true} to validate header values according to
-     * <a href="https://datatracker.ietf.org/doc/html/rfc7230#section-3.2">rfc7230</a> and
-     * <a href="https://datatracker.ietf.org/doc/html/rfc5234#appendix-B.1">rfc5234</a>. Otherwise, {@code false}
-     * (the default) to not validate values.
+     * <a href="https://www.rfc-editor.org/rfc/rfc9113.html#name-http-fields">RFC 9113</a>. Otherwise, {@code false}
+     * to not validate values.
      * @param arraySizeHint A hint as to how large the hash data structure should be.
      * The next positive power of two will be used. An upper bound may be enforced.
      */
     @SuppressWarnings("unchecked")
-    public DefaultHttp2Headers(boolean validate, boolean validateValues, int arraySizeHint) {
+    public DefaultHttp2Headers(boolean validateNames, boolean validateValues, int arraySizeHint) {
         // Case sensitive compare is used because it is cheaper, and header validation can be used to catch invalid
         // headers.
         super(CASE_SENSITIVE_HASHER,
                 CharSequenceValueConverter.INSTANCE,
-                validate ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
+                validateNames ? HTTP2_NAME_VALIDATOR : NameValidator.NOT_NULL,
                 arraySizeHint,
-                validateValues ? VALUE_VALIDATOR : (ValueValidator<CharSequence>) ValueValidator.NO_VALIDATION);
+                validateValues ? HTTP2_VALUE_VALIDATOR : (ValueValidator<CharSequence>) ValueValidator.NO_VALIDATION);
     }
 
     @Override
@@ -269,6 +259,78 @@ public class DefaultHttp2Headers
     protected final HeaderEntry<CharSequence, CharSequence> newHeaderEntry(int h, CharSequence name, CharSequence value,
                                                            HeaderEntry<CharSequence, CharSequence> next) {
         return new Http2HeaderEntry(h, name, value, next);
+    }
+
+    /**
+     * Validate the given HTTP/2 header value by searching for any illegal characters.
+     * <p>
+     * Same field-content rules as {@code HttpHeaderValidationUtil.validateValidHeaderValue(CharSequence)}, except that
+     * {@link AsciiString} values backed by an array slice are checked up to their real end, and characters above
+     * {@code 0xFF} are left to the HPACK encoder, which sanitizes them to {@code '?'}.
+     *
+     * @param value The HTTP/2 header value to validate.
+     * @return The index of the first illegal character found, or {@code -1} if there are none and the header value is
+     * valid.
+     */
+    private static int validateValidHeaderValue(CharSequence value) {
+        int length = value.length();
+        if (length == 0) {
+            return -1;
+        }
+        if (value instanceof AsciiString) {
+            return verifyValidHeaderValueAsciiString((AsciiString) value);
+        }
+        return verifyValidHeaderValueCharSequence(value);
+    }
+
+    private static int verifyValidHeaderValueAsciiString(AsciiString value) {
+        // Validate value to field-content rule.
+        //  field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+        //  field-vchar    = VCHAR / obs-text
+        //  VCHAR          = %x21-7E ; visible (printing) characters
+        //  obs-text       = %x80-FF
+        //  SP             = %x20
+        //  HTAB           = %x09 ; horizontal tab
+        //  See: https://www.rfc-editor.org/rfc/rfc9113.html#name-field-validity
+        //  And: https://datatracker.ietf.org/doc/html/rfc5234#appendix-B.1
+        final byte[] array = value.array();
+        final int start = value.arrayOffset();
+        int b = array[start] & 0xFF;
+        if (b < 0x21 || b == 0x7F) {
+            return 0;
+        }
+        int end = start + value.length();
+        for (int i = start + 1; i < end; i++) {
+            b = array[i] & 0xFF;
+            if (b < 0x20 && b != 0x09 || b == 0x7F) {
+                return i - start;
+            }
+        }
+        return -1;
+    }
+
+    private static int verifyValidHeaderValueCharSequence(CharSequence value) {
+        // Validate value to field-content rule.
+        //  field-content  = field-vchar [ 1*( SP / HTAB ) field-vchar ]
+        //  field-vchar    = VCHAR / obs-text
+        //  VCHAR          = %x21-7E ; visible (printing) characters
+        //  obs-text       = %x80-FF
+        //  SP             = %x20
+        //  HTAB           = %x09 ; horizontal tab
+        //  See: https://www.rfc-editor.org/rfc/rfc9113.html#name-field-validity
+        //  And: https://datatracker.ietf.org/doc/html/rfc5234#appendix-B.1
+        int b = value.charAt(0);
+        if (b < 0x21 || b == 0x7F) {
+            return 0;
+        }
+        int length = value.length();
+        for (int i = 1; i < length; i++) {
+            b = value.charAt(i);
+            if (b < 0x20 && b != 0x09 || b == 0x7F) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     private final class Http2HeaderEntry extends HeaderEntry<CharSequence, CharSequence> {

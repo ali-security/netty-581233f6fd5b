@@ -216,6 +216,22 @@ public class Http2FrameCodecTest {
     }
 
     @Test
+    public void inboundHeadersWithIllegalValueCharactersAreRejectedByDefault() throws Exception {
+        // A peer must not be able to get CR/LF/NUL into a header value the application sees, from where it could
+        // be copied into an HTTP/1.x message (header injection / response splitting).
+        Http2Headers maliciousRequest = new DefaultHttp2Headers(false)
+                .method(HttpMethod.GET.asciiName()).scheme(HttpScheme.HTTPS.name())
+                .authority(new AsciiString("example.org")).path(new AsciiString("/foo"))
+                .add(new AsciiString("x-foo"), new AsciiString("bar\r\nx-injected: 1"));
+        frameInboundWriter.writeInboundHeaders(3, maliciousRequest, 0, true);
+
+        assertNull(inboundHandler.readInbound());
+        verify(frameWriter).writeRstStream(
+                eqFrameCodecCtx(), eq(3), eq(Http2Error.PROTOCOL_ERROR.code()), anyChannelPromise());
+        assertTrue(channel.isActive());
+    }
+
+    @Test
     public void flowControlShouldBeResilientToMissingStreams() throws Http2Exception {
         Http2Connection conn = new DefaultHttp2Connection(true);
         Http2ConnectionEncoder enc = new DefaultHttp2ConnectionEncoder(conn, new DefaultHttp2FrameWriter());

@@ -89,6 +89,34 @@ public class ReadOnlyHttp2HeadersTest {
     }
 
     @Test
+    public void illegalValuesAreNotAllowed() {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                ReadOnlyHttp2Headers.trailers(true, new AsciiString("foo"), new AsciiString("ba\nr"));
+            }
+        });
+    }
+
+    @Test
+    public void illegalPseudoHeaderValuesAreNotAllowed() {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                ReadOnlyHttp2Headers.clientHeaders(true, new AsciiString("GET"),
+                        new AsciiString("/foo\r\nx-injected: 1"), new AsciiString("https"),
+                        new AsciiString("example.org"));
+            }
+        });
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                ReadOnlyHttp2Headers.serverHeaders(true, new AsciiString("200\r\nx-injected: 1"));
+            }
+        });
+    }
+
+    @Test
     public void emptyHeaderNameAllowed() {
         ReadOnlyHttp2Headers.trailers(false, AsciiString.EMPTY_STRING, new AsciiString("foo"));
     }
