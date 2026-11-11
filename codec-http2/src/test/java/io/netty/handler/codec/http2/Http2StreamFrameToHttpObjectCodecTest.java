@@ -34,6 +34,7 @@ import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
@@ -445,6 +446,27 @@ public class Http2StreamFrameToHttpObjectCodecTest {
         assertThat(headers.scheme().toString(), is("http"));
         assertThat(headers.method().toString(), is("GET"));
         assertThat(headers.path().toString(), is("/hello/world"));
+        assertTrue(headersFrame.isEndStream());
+
+        assertThat(ch.readOutbound(), is(nullValue()));
+        assertFalse(ch.finish());
+    }
+
+    @Test
+    public void testEncodeAbsoluteFormRequestTargetAuthorityTakesPrecedenceOverConflictingHost() throws Exception {
+        EmbeddedChannel ch = new EmbeddedChannel(new Http2StreamFrameToHttpObjectCodec(false));
+        FullHttpRequest request = new DefaultFullHttpRequest(
+                HttpVersion.HTTP_1_1, HttpMethod.GET, "http://request-target.example/admin");
+        request.headers().set(HttpHeaderNames.HOST, "host-header.example");
+        assertTrue(ch.writeOutbound(request));
+
+        Http2HeadersFrame headersFrame = ch.readOutbound();
+        Http2Headers headers = headersFrame.headers();
+
+        assertThat(headers.scheme().toString(), is("http"));
+        assertThat(headers.method().toString(), is("GET"));
+        assertThat(headers.path().toString(), is("/admin"));
+        assertThat(headers.authority().toString(), is("request-target.example"));
         assertTrue(headersFrame.isEndStream());
 
         assertThat(ch.readOutbound(), is(nullValue()));

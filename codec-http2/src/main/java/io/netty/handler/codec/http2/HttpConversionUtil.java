@@ -442,8 +442,13 @@ public final class HttpConversionUtil {
             } else {
                 URI requestTargetUri = URI.create(request.uri());
                 out.path(toHttp2Path(requestTargetUri));
-                // Take from the request-line if HOST header was empty
-                host = isNullOrEmpty(host) ? requestTargetUri.getAuthority() : host;
+                // The absolute-form request-target authority is authoritative and takes precedence over
+                // a (potentially conflicting) HOST header, per RFC 9112 section 3.2 and RFC 9113 section 8.3.1.
+                // Otherwise take from the HOST header, falling back to the request-line if HOST was empty.
+                String requestTargetAuthority = requestTargetUri.getAuthority();
+                boolean absoluteFormAuthority =
+                        requestTargetUri.getScheme() != null && !isNullOrEmpty(requestTargetAuthority);
+                host = absoluteFormAuthority || isNullOrEmpty(host) ? requestTargetAuthority : host;
                 setHttp2Scheme(inHeaders, requestTargetUri, out);
             }
             setHttp2Authority(host, out);
