@@ -153,6 +153,37 @@ public class DelegatingDecompressorFrameListenerTest {
      * in buffer was retained and the channel will not release it in that case, so a remote peer was able to leak
      * one reference of the received buffer per frame and so exhaust the memory of the JVM.
      */
+    @Test
+    public void dataFramesAfterDecompressorClosedDoNotLeak() throws Exception {
+        // Closes (finishes) the decompressor while it is still attached to the stream.
+        ByteBuf endOfStreamData = Unpooled.buffer();
+        try {
+            decompressorListener.onDataRead(ctx, STREAM_ID, endOfStreamData, 0, true);
+        } finally {
+            if (endOfStreamData.refCnt() > 0) {
+                endOfStreamData.release();
+            }
+        }
+
+        // Replay the same buffer as if it were received via a flood of DATA frames for the already finished
+        // stream. Each of them must fail the stream without taking ownership of the buffer, so its reference
+        // count must not grow. Without the fix it climbs by one for every frame.
+        final ByteBuf data = Unpooled.buffer().writeZero(16);
+        try {
+            for (int i = 0; i < 8; i++) {
+                Http2Exception e = assertThrows(Http2Exception.class, new Executable() {
+                    @Override
+                    public void execute() throws Throwable {
+                        decompressorListener.onDataRead(ctx, STREAM_ID, data, 0, false);
+                    }
+                });
+                assertEquals(Http2Error.INTERNAL_ERROR, e.error());
+                assertEquals(1, data.refCnt(), "buffer was retained by DATA frame " + i + " and never released");
+            }
+        } finally {
+            data.release();
+        }
+    }
 
     /**
      * Regression test for CVE-2025-58057. A small, highly compressed DATA frame must not be fully inflated and
