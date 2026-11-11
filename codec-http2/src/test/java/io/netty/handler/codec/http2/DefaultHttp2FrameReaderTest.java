@@ -27,6 +27,7 @@ import org.mockito.MockitoAnnotations;
 
 import static io.netty.handler.codec.http2.Http2CodecUtil.*;
 import static io.netty.handler.codec.http2.Http2FrameTypes.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.*;
 
@@ -101,6 +102,59 @@ public class DefaultHttp2FrameReaderTest {
             frameReader.readFrame(ctx, input, listener);
 
             verify(listener).onHeadersRead(ctx, 1, headers.add("foo", "bar"), 0, true);
+        } finally {
+            input.release();
+        }
+    }
+
+    @Test
+    public void readHeaderFrameAndContinuationFrameExceedMax() throws Http2Exception {
+        frameReader = new DefaultHttp2FrameReader(new DefaultHttp2HeadersDecoder(true), 2);
+        final int streamId = 1;
+
+        final ByteBuf input = Unpooled.buffer();
+        try {
+            Http2Headers headers = new DefaultHttp2Headers()
+                    .authority("foo")
+                    .method("get")
+                    .path("/")
+                    .scheme("https");
+            writeHeaderFrame(input, streamId, headers,
+                    new Http2Flags().endOfHeaders(false).endOfStream(true));
+            writeContinuationFrame(input, streamId, new DefaultHttp2Headers().add("foo", "bar"),
+                    new Http2Flags().endOfHeaders(false));
+            writeContinuationFrame(input, streamId, new DefaultHttp2Headers().add("foo2", "bar2"),
+                    new Http2Flags().endOfHeaders(false));
+
+            Http2Exception ex = assertThrows(Http2Exception.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    frameReader.readFrame(ctx, input, listener);
+                }
+            });
+            assertEquals(Http2Error.ENHANCE_YOUR_CALM, ex.error());
+        } finally {
+            input.release();
+        }
+    }
+
+    @Test
+    public void readHeaderFrameAndContinuationFrameDontExceedMax() throws Http2Exception {
+        frameReader = new DefaultHttp2FrameReader(new DefaultHttp2HeadersDecoder(true), 2);
+        final int streamId = 1;
+
+        final ByteBuf input = Unpooled.buffer();
+        try {
+            Http2Headers headers = new DefaultHttp2Headers()
+                    .authority("foo")
+                    .method("get")
+                    .path("/")
+                    .scheme("https");
+            writeHeaderFrame(input, streamId, headers,
+                    new Http2Flags().endOfHeaders(false).endOfStream(true));
+            writeContinuationFrame(input, streamId, new DefaultHttp2Headers().add("foo", "bar"),
+                    new Http2Flags().endOfHeaders(false));
+            frameReader.readFrame(ctx, input, listener);
         } finally {
             input.release();
         }
